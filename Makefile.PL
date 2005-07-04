@@ -5,6 +5,7 @@ WriteMakefile
           'NAME' => 'Net::SMTP::Retryable',
           'VERSION_FROM' => 'lib/Net/SMTP/Retryable.pm',
           'PREREQ_PM' => {
+                           'Class::Delegation' => 0,
                            'Net::SMTP' => 0,
                            'Time::HiRes' => 0
                          },

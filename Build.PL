@@ -7,6 +7,7 @@ my $build = Module::Build->new(
         requires => {
             'Net::SMTP' => 0,
             'Time::HiRes' => 0,
+            'Class::Delegation' => 0,
         });
 
 $build->config_data('smtp-server' => $build->prompt("Enter a valid SMTP server for testing", ""));

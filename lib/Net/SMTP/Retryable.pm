@@ -1,8 +1,8 @@
 #
 # Net::SMTP::Retryable - Wrapper for Net::SMTP which supports retries
 #
-# $Id: Retryable.pm,v 1.1 2005/07/01 02:40:29 mprewitt Exp $
-# $Source: /home/cvs/chelsea/perllib/Net/SMTP/Retryable.pm,v $
+# $Id: Retryable.pm,v 1.6 2005/07/04 20:00:29 mprewitt Exp $
+# $Source: /home/cvs/chelsea/netsmtp-retryable/lib/Net/SMTP/Retryable.pm,v $
 # $Locker:  $
 #
 
@@ -22,8 +22,8 @@ B<Net::SMTP::Retryable> - Net::SMTP wrapper
             retryfactor => .25
             );
 
-    $smtp = new Net::SMTP::Retryable($mailhost, %options);
-    $smtp = new Net::SMTP::Retryable([ $mailhost1, $mailhost2, ...], %options);
+    $smtp = Net::SMTP->new($mailhost, %options);
+    $smtp = Net::SMTP->new([ $mailhost1, $mailhost2, ...], %options);
 
     $smtp->SendMail(mail=>$from, to=>$to, data=>$body);
 
@@ -39,9 +39,8 @@ host until one succeeds.  However, if you loose your connection,
 it is up to you to reconnect and resend your message.  This leads to
 code which has reconnection and retries and usually ends up as a mess.
 
-This class keeps provides a Net::SMTP object with retry and 
-reconnect logic on sending.  The following Net::SMTP commands
-are wrapped to offer retry logic:
+This class adds retry and reconnect logic to Net::SMTP commands 
+The following Net::SMTP commands are patched to offer retry logic:
 
     $smtp->mail()
     $smtp->send()
@@ -94,30 +93,16 @@ L<Net::SMTP>
 =cut
 #---------------------------------------------------------------------
 
-package Net::SMTP::Retryable;
-
-$VERSION = '0.0.1';
+$VERSION = '0.0.2';
 
 use strict;
-use warnings;
+#use warnings;
+
+package Net::SMTP::Retryable;
+
 use Net::SMTP;
 use Scalar::Util 'refaddr';
 use Time::HiRes;
-
-my $LOG;
-BEGIN {
-    eval {
-        use Log::Log4perl;
-        $LOG = Log::Log4perl->get_logger(__PACKAGE__);
-    };
-    $LOG = Net::SMTP::Retryable::SimpleLog->new(Net::SMTP::Retryable::SimpleLog::FATAL()) 
-        if length $@;
-}
-
-
-use constant DEFAULT_CONNECT_RETRIES => 0;
-use constant DEFAULT_RESEND_RETRIES => 0;
-use constant DEFAULT_RETRY_FACTOR => 1;
 
 # We're an inside-out object.  See "Perl Best Practices", Conway.
 # These are each object's attributes.
@@ -129,86 +114,62 @@ my %connectretries;
 my %savedcommands;
 my %smtp;
 my %opts;
-
-#
-# Cleanup attributes for the destroyed object to prevent
-# memory leaks.
-#
-sub DESTROY {
-    my $self = shift;
-    delete $mailhosts{refaddr $self};
-    delete $retryfactor{refaddr $self};
-    delete $sendretries{refaddr $self};
-    delete $connectretries{refaddr $self};
-    delete $smtp{refaddr $self};
-    delete $opts{refaddr $self};
+my $net_smtp_new;
+BEGIN {
+    $net_smtp_new = \&Net::SMTP::new;
 }
 
-#---------------------------------------------------------------------
+my $LOG;
+BEGIN {
+    eval {
+        use Log::Log4perl;
+        $LOG = Log::Log4perl->get_logger(__PACKAGE__);
+    };
+    $LOG = Net::SMTP::Retryable::SimpleLog->new(Net::SMTP::Retryable::SimpleLog::FATAL()) 
+        if length $@;
+}
 
-=head2 new
-
-    $smtp = Net::SMTP::Retryable->new( $mailhost, %options );
-
-    $smtp = Net::SMTP::Retryable->new( \@mailhosts, %options );
-B<PARAMETERS:> 
-
-    $mailhost - Outgoing SMTP host to connect to or array of hosts
-    to connect to
-
-    %options  - Optional parameters:
-        connectretries => $number of times to retry a connection (default=0)
-        sendretries => $number of times to retry a send attempt (default=0)
-        retryfactor => number of seconds to pause between each 
-        reconnect attempt.  Number can be less than 1, number
-        is doubled on each successive reconnect attempt. (default=1)
-
-B<RETURN VALUES:> Reference to instantiated object.
-
-=cut
-sub new {
-    my $type     = shift;
-    my $mailhost = shift;
-    my %opts     = @_;
-    my $self     = \do {my $anon_scalar};
-    bless $self => $type;
-
-    if ( ref($mailhost) eq 'ARRAY' ) {
-        $mailhosts{refaddr $self} = $mailhost;
+# 
+# Create methods for commands we want to be retryable
+#
+foreach my $method (qw( mail send send_and_mail send_or_mail to cc bcc recipient )) {
+    no strict 'refs';
+    *$method = sub {
+        my $self = shift;
+        return $self->cmd_with_retry( $method, @_ );
     }
-    elsif ( ref($mailhost) ) {
-        $LOG->error("Non array ref reference passed to new as first arg.");
-        return;
-    }
-    else {
-        $mailhosts{refaddr $self} = [$mailhost];
-    }
-
-    $retryfactor{refaddr $self} = $opts{retryfactor} || DEFAULT_RETRY_FACTOR;
-    $sendretries{refaddr $self} = $opts{sendretries} || DEFAULT_RESEND_RETRIES;
-    $connectretries{refaddr $self} = $opts{connectretries} || DEFAULT_CONNECT_RETRIES;
-
-    # save the rest of the options to send to Net::SMTP->new
-    delete $opts{retryfactor};
-    delete $opts{sendretries};
-    delete $opts{connectretries};
-    $opts{refaddr $self} = \%opts;
-
-    $self->_ConnectToMailHost() || return;
-
-    return $self;
 }
 
 #
-# _ReConnectToMailHost
+# Send the mail with retry/reconnect logic
 #
-# Reconnect to the mail host and replay any commands up to the point
-# that the connection failed.
-#
-sub _ReconnectToMailHost {
+sub data {
     my $self = shift;
-    $self->_ConnectToMailHost() || return;
-    $self->SendMail(%{$savedcommands{refaddr $self}});
+    my $smtp = $smtp{refaddr $self};
+    my $retry = 0;
+    my $result;
+    while ( !($result = $smtp->data( @_ )) && $retry++ <= $sendretries{refaddr $self} ) {
+        $LOG->warn("error in 'data': " . $smtp->message . " code: " .  $smtp->code);
+        $smtp->reset();    # ?? can't be called after data sent
+        $smtp->quit();
+        $LOG->warn("Reconnecting to mailhost");
+        my $error;
+        last unless $self->_ReconnectToMailHost();
+    };
+
+    $self->_Reset();
+
+    return $result if $result;
+    $LOG->warn( $smtp->message );
+    return;
+}
+
+sub dataend {
+    my $self = shift;
+
+    $self->_Reset();
+
+    return $smtp{refaddr $self}->dataend( @_ );
 }
 
 #
@@ -226,7 +187,7 @@ sub _ConnectToMailHost {
         my $connects = 1;
         do {
             return 1
-              if $smtp{refaddr $self} = Net::SMTP->new( $mailhost, %{ $opts{refaddr $self} } );
+              if $smtp{refaddr $self} = $net_smtp_new->( 'Net::SMTP', $mailhost, %{ $opts{refaddr $self} } );
             $error = "SMTP could not connect to $mailhost.";
             $LOG->warn($error);
             Time::HiRes::sleep($retryfactor{refaddr $self} * $connects);
@@ -234,6 +195,18 @@ sub _ConnectToMailHost {
     }
     $LOG->warn($error);
     return;
+}
+
+#
+# _ReConnectToMailHost
+#
+# Reconnect to the mail host and replay any commands up to the point
+# that the connection failed.
+#
+sub _ReconnectToMailHost {
+    my $self = shift;
+    $self->_ConnectToMailHost() || return;
+    $self->SendMail(%{$savedcommands{refaddr $self}});
 }
 
 #
@@ -248,34 +221,13 @@ sub _Reset {
     return 1;
 }
 
-
-# 
-# Intercept methods we want to wrap in the retry.  Delegate anything
-# else to the Net::SMTP object.
 #
-our $AUTOLOAD;
-sub AUTOLOAD {
-    my $self   = shift;
-    my $method = $AUTOLOAD;
-    $method =~ s/.*:://;
-
-    return if $method eq 'DESTROY';
-
-    if (grep(/$method/, qw( mail send send_and_mail send_or_mail to cc bcc recipient ))) {
-        return $self->_retry( $method, @_ );
-    }
-
-    return $smtp{refaddr $self}->$method(@_);
-}
-
-
+# $smtp->cmd_with_retry($cmd, @args)
 #
-# $smtp->_retry($method, @args)
-#
-# Save the arguments for later replay and run the method
+# Save the arguments for later replay and run the command
 # retrying up to $smtp->{opts}->{sendretries}
 #
-sub _retry {
+sub cmd_with_retry {
     my $self = shift;
     my $method = shift;
 
@@ -285,6 +237,7 @@ sub _retry {
     my $result;
     my $connects;
 
+    $LOG->debug( "Calling: $method" );
     while ( !($result = $smtp->$method(@_)) && $connects++ <= $sendretries{refaddr $self} )
     {
         $LOG->warn( "error in '$method' for @_: " . $smtp->message . " code: "
@@ -345,41 +298,118 @@ sub SendMail {
     return $return;
 }
 
-#
-# Send the mail with retry/reconnect logic
-#
-sub data {
-    my $self = shift;
-    my $smtp = $smtp{refaddr $self};
-    my $retry = 0;
-    my $result;
-    while ( !($result = $smtp->data( @_ )) && $retry++ <= $sendretries{refaddr $self} ) {
-        $LOG->warn("error in 'data': " . $smtp->message . " code: " .  $smtp->code);
-        $smtp->reset();    # ?? can't be called after data sent
-        $smtp->quit();
-        $LOG->warn("Reconnecting to mailhost");
-        my $error;
-        last unless $self->_ReconnectToMailHost();
-    };
+=head2 get_smtp
 
-    $self->_Reset();
+    $net_smtp = $net_smtp_retryable->get_smtp();
 
-    return $result if $result;
-    $LOG->warn( $smtp->message );
-    return;
+Returns the underlying smtp object.
+
+=cut
+sub get_smtp {
+    return $smtp{refaddr $_[0]};
 }
 
-sub dataend {
+#
+# Cleanup attributes for the destroyed object to prevent
+# memory leaks.
+#
+sub DESTROY {
     my $self = shift;
+    delete $mailhosts{refaddr $self};
+    delete $retryfactor{refaddr $self};
+    delete $sendretries{refaddr $self};
+    delete $connectretries{refaddr $self};
+    delete $smtp{refaddr $self};
+    delete $opts{refaddr $self};
+}
 
-    $self->_Reset();
+our $AUTOLOAD;
+sub AUTOLOAD {
+    my $self = shift;
+    my $method = $AUTOLOAD;
+    $method =~ s/.*:://;
+    return $smtp{refaddr $self}->$method(@_);
+}
 
-    return $smtp{refaddr $self}->dataend(@_);
+package Net::SMTP;
+
+use Scalar::Util 'refaddr';
+
+my $LOG;
+BEGIN {
+    eval {
+        use Log::Log4perl;
+        $LOG = Log::Log4perl->get_logger(__PACKAGE__);
+    };
+    $LOG = Net::SMTP::Retryable::SimpleLog->new(Net::SMTP::Retryable::SimpleLog::FATAL()) 
+        if length $@;
+}
+
+
+use constant DEFAULT_CONNECT_RETRIES => 0;
+use constant DEFAULT_RESEND_RETRIES => 0;
+use constant DEFAULT_RETRY_FACTOR => 1;
+
+#---------------------------------------------------------------------
+
+=head2 new
+
+    $smtp = Net::SMTP::Retryable->new( $mailhost, %options );
+
+    $smtp = Net::SMTP::Retryable->new( \@mailhosts, %options );
+B<PARAMETERS:> 
+
+    $mailhost - Outgoing SMTP host to connect to or array of hosts
+    to connect to
+
+    %options  - Optional parameters:
+        connectretries => $number of times to retry a connection (default=0)
+        sendretries => $number of times to retry a send attempt (default=0)
+        retryfactor => number of seconds to pause between each 
+        reconnect attempt.  Number can be less than 1, number
+        is doubled on each successive reconnect attempt. (default=1)
+
+B<RETURN VALUES:> Reference to instantiated object.
+
+=cut
+
+
+sub new {
+    my $type     = shift;
+    my $mailhost = shift;
+    my %opts     = @_;
+    my $self     = \do {my $anon_scalar};
+    bless $self => 'Net::SMTP::Retryable';
+
+    if ( ref($mailhost) eq 'ARRAY' ) {
+        $mailhosts{refaddr $self} = $mailhost;
+    }
+    elsif ( ref($mailhost) ) {
+        $LOG->error("Non array ref reference passed to new as first arg.");
+        return;
+    }
+    else {
+        $mailhosts{refaddr $self} = [$mailhost];
+    }
+
+    $retryfactor{refaddr $self} = $opts{retryfactor} || DEFAULT_RETRY_FACTOR;
+    $sendretries{refaddr $self} = $opts{sendretries} || DEFAULT_RESEND_RETRIES;
+    $connectretries{refaddr $self} = $opts{connectretries} || DEFAULT_CONNECT_RETRIES;
+
+    # save the rest of the options to send to Net::SMTP->new
+    delete $opts{retryfactor};
+    delete $opts{sendretries};
+    delete $opts{connectretries};
+    $opts{refaddr $self} = \%opts;
+
+    $self->_ConnectToMailHost() || return;
+
+    return $self;
 }
 
 #---------------------------------------------------------------------
 # A simple logging package that looks/works like log4perl
-
+#
 package Net::SMTP::Retryable::SimpleLog;
 
 use constant FATAL => 0;
